@@ -89,7 +89,6 @@ class KernelBuilder:
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             v_val1 = v_consts[f"h1_{hi}"]
             v_val3 = v_consts[f"h3_{hi}"]
-            # op1 and op3 are independent (both read v_val_addr)
             self.instrs.append({"valu": [
                 (op1, v_tmp1, v_val_addr, v_val1),
                 (op3, v_tmp2, v_val_addr, v_val3),
@@ -117,14 +116,12 @@ class KernelBuilder:
         tmp_addr = self.alloc_scratch("tmp_addr")
         tmp_addr2 = self.alloc_scratch("tmp_addr2")
 
-        # Vector constants
         v_consts = {}
         for val in [0, 1, 2]:
             addr = self.alloc_scratch(f"v_const_{val}", VLEN)
             self.add("valu", ("vbroadcast", addr, self.scratch_const(val)))
             v_consts[val] = addr
 
-        # Hash constants (broadcast to vectors)
         for hi, (_, val1, _, _, val3) in enumerate(HASH_STAGES):
             a1 = self.alloc_scratch(f"vh1_{hi}", VLEN)
             a3 = self.alloc_scratch(f"vh3_{hi}", VLEN)
@@ -133,9 +130,7 @@ class KernelBuilder:
             v_consts[f"h1_{hi}"] = a1
             v_consts[f"h3_{hi}"] = a3
 
-        # Load parameters from memory header
-        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
-                     "forest_values_p", "inp_indices_p", "inp_values_p"]
+        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height","forest_values_p", "inp_indices_p", "inp_values_p"]
         for v in init_vars:
             self.alloc_scratch(v, 1)
         for i, v in enumerate(init_vars):
@@ -144,14 +139,12 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
-        # Vector scratch
         v_idx = self.alloc_scratch("v_idx", VLEN)
         v_val = self.alloc_scratch("v_val", VLEN)
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
 
-        # 8 scalar temps for scatter-gather address computation
         gather_addrs = [self.alloc_scratch(f"ga_{vi}") for vi in range(VLEN)]
 
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
@@ -177,47 +170,35 @@ class KernelBuilder:
         ]})
 
         for iter_idx in range(total_iters):
-            # Cycle 1: Load indices and values vectors (2 load slots)
             self.instrs.append({"load": [
                 ("vload", v_idx, tmp_addr),
                 ("vload", v_val, tmp_addr2),
             ]})
-
-            # Cycle 2: Compute all 8 gather addresses in parallel (8 ALU slots)
             self.instrs.append({"alu": [
                 ("+", gather_addrs[vi], fvp, v_idx + vi) for vi in range(VLEN)
             ]})
 
-            # Cycles 3-6: Gather node values, 2 loads per cycle
             for pair in range(0, VLEN, 2):
                 self.instrs.append({"load": [
                     ("load", v_node_val + pair, gather_addrs[pair]),
                     ("load", v_node_val + pair + 1, gather_addrs[pair + 1]),
                 ]})
 
-            # Cycle 7: XOR input values with node values
             self.instrs.append({"valu": [("^", v_val, v_val, v_node_val)]})
 
-            # Cycles 8-19: Hash (6 stages × 2 cycles = 12 cycles)
             self.build_vector_hash(v_val, v_tmp1, v_tmp2, v_consts)
 
-            # Cycle 20: Branch logic - compute 2*idx+1 and val&1 in parallel
-            # idx = 2*idx + (1 if val%2==0 else 2) = 2*idx + 1 + (val & 1)
             self.instrs.append({"valu": [
                 ("multiply_add", v_tmp1, v_idx, v_consts[2], v_consts[1]),  # 2*idx + 1
-                ("&", v_tmp2, v_val, v_consts[1]),                          # val & 1
+                ("&", v_tmp2, v_val, v_consts[1]),                         
             ]})
 
-            # Cycle 21: Combine
             self.instrs.append({"valu": [("+", v_idx, v_tmp1, v_tmp2)]})
 
-            # Cycle 22: Bounds check
             self.instrs.append({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
 
-            # Cycle 23: Wrap out-of-bounds indices to 0
             self.instrs.append({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_consts[0])]})
 
-            # Cycle 24: Store results + compute next iteration's addresses
             if iter_idx < total_iters - 1:
                 next_ic = i_consts[all_offsets[iter_idx + 1]]
                 self.instrs.append({
